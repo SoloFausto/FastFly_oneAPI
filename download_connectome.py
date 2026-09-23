@@ -1,6 +1,6 @@
 """
 Download the real FlyWire connectome and convert to binary format
-for the CUDA simulator.
+for the oneAPI SYCL simulator.
 
 Source: Shiu et al. 2024, Nature - "A Drosophila computational brain
 model reveals sensorimotor processing"
@@ -10,7 +10,7 @@ Data: Materialization v783 (final proofread version)
   - Connectivity_783.parquet: edge list with integer indices + signed weights
   - Completeness_783.csv: neuron metadata (defines index mapping)
 
-Output: flywire_v783.bin (binary file for CUDA simulator)
+Output: flywire_v783.bin (binary file for the oneAPI SYCL simulator)
   Header:  magic(4) + version(4) + num_neurons(4) + num_synapses(4)
   Data:    offsets[N+1] (uint32) + targets[S] (uint32) + weights[S] (float32)
 

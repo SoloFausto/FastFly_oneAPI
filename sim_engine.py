@@ -1,5 +1,5 @@
 """
-SimEngine — importable wrapper around the FlyWire CuPy simulator.
+SimEngine — importable wrapper around the FlyWire SYCL simulator.
 
 Loads neuron_annotations.npz (from download_metadata.py) for biologically
 meaningful stimuli, heatmap groups, 3D positions, and motor neuron detail.
@@ -13,95 +13,82 @@ import base64
 import os
 import time
 import sys
+import threading
 import numpy as np
 
-try:
-    import cupy as cp
-except ImportError:
-    print("ERROR: CuPy not installed.  Run:  pip install cupy-cuda12x")
-    sys.exit(1)
-
-from flywire_sim import (CUDA_KERNELS, compile_kernels, load_connectome_binary,
-                         generate_synthetic, quantize_weights_int8)
+from flywire_sim import load_connectome_binary, generate_synthetic
+from sycl_backend import NativeSimulation
 
 ANNOTATIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "neuron_annotations.npz")
 
 
 class SimEngine:
-    """GPU-accelerated LIF simulator wrapping CuPy CUDA kernels."""
+    """GPU-accelerated LIF simulator using the native SYCL backend."""
 
-    def __init__(self, data_file=None, seed=42):
+    def __init__(self, data_file=None, seed=42, *, n_neurons=139255,
+                 n_synapses=54500000, device_selector=None):
+        self._lock = threading.RLock()
         if data_file:
             self.n_neurons, self.n_synapses, offsets, targets, weights = \
                 load_connectome_binary(data_file)
         else:
             self.n_neurons, self.n_synapses, offsets, targets, weights = \
-                generate_synthetic(seed=seed)
-
-        self.kernels = compile_kernels()
+                generate_synthetic(n_neurons, n_synapses, seed=seed)
         self.seed = seed
         self.current_step = 0
-
-        # GPU arrays — connectivity
-        self.d_offsets = cp.asarray(offsets)
-        self.d_targets = cp.asarray(targets)
-        w_int8, w_scales = quantize_weights_int8(weights, offsets, self.n_neurons)
-        self.d_weights = cp.asarray(w_int8)
-        self.d_weight_scales = cp.asarray(w_scales)
-
-        # GPU arrays — neuron state
-        rng = cp.random.default_rng(seed)
-        self.d_voltage = rng.uniform(0.0, 0.9, self.n_neurons).astype(cp.float32)
-        self.d_current = cp.zeros(self.n_neurons, dtype=cp.float32)
-
-        # Spike bookkeeping
-        self.spike_words = (self.n_neurons + 31) // 32
-        self.d_spike_bits = cp.zeros(self.spike_words, dtype=cp.uint32)
-        self.d_spike_idx  = cp.zeros(self.n_neurons, dtype=cp.uint32)
-        self.d_num_spikes = cp.zeros(1, dtype=cp.uint32)
-
-        # LIF parameters
-        self.tau_decay   = np.float32(0.9)
+        voltage = np.random.default_rng(seed).uniform(0.0, 0.9, self.n_neurons).astype(np.float32)
+        self._backend = NativeSimulation(offsets, targets, weights, voltage, seed=seed,
+                                         int8_weights=True, device_selector=device_selector)
+        self.tau_decay = np.float32(0.9)
         self.v_threshold = np.float32(1.0)
-        self.v_reset     = np.float32(0.0)
-        self.noise_amp   = np.float32(0.4)
-
-        # Launch config
-        self.BLOCK = 256
-        self.PROP_BLOCK = 128
-        self.MAX_PROP_BLOCKS = 2048
-        self.neuron_blocks  = (self.n_neurons + self.BLOCK - 1) // self.BLOCK
-        self.compact_blocks = (self.spike_words + self.BLOCK - 1) // self.BLOCK
-
-        # Stimulus state
+        self.v_reset = np.float32(0.0)
+        self.noise_amp = np.float32(0.4)
         self._stimulus_indices = None
         self._stimulus_amplitude = 0.0
-
-        # Last-step spike indices (for 3D viz)
-        self._last_spike_indices = np.array([], dtype=np.int32)
-
-        # GPU accumulators for sync-free counting
-        self.d_total_spikes = cp.zeros(1, dtype=cp.uint64)
-
-        # Feature toggles (can be set at runtime)
+        self._last_spike_indices = np.array([], dtype=np.uint32)
         self.send_active_indices = True
         self.send_group_rates = True
         self.send_motor_rates = True
-        self.active_indices_interval = 3  # only transfer every Nth batch
+        self.active_indices_interval = 3
         self._batch_counter = 0
-
-        # Load annotations
-        self._load_annotations()
-
-        # Metrics history
+        try:
+            self._load_annotations()
+            self._backend.set_groups(self._neuron_to_group, self.num_groups,
+                                      self._neuron_to_motor, self._num_motor_groups)
+        except Exception:
+            self._backend.close()
+            raise
         self.group_rates_history = []
+
+    @property
+    def device_name(self):
+        return self._backend.device_name
+
+    def close(self):
+        with self._lock:
+            self._backend.close()
+
+    def __enter__(self):
+        self._backend.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
 
     def _load_annotations(self):
         """Load neuron_annotations.npz for biological groups, stimuli, positions."""
+        data = None
         if os.path.exists(ANNOTATIONS_FILE):
+            with np.load(ANNOTATIONS_FILE, allow_pickle=True) as archive:
+                data = {name: archive[name] for name in archive.files}
+            for name in ("root_ids", "pos_x", "pos_y", "pos_z", "super_class"):
+                if name in data and len(data[name]) != self.n_neurons:
+                    print("Annotation neuron count does not match this connectome; using index groups.")
+                    data = None
+                    break
+        if data is not None:
             print(f"Loading neuron annotations from {ANNOTATIONS_FILE}...")
-            data = np.load(ANNOTATIONS_FILE, allow_pickle=True)
 
             # Root IDs
             self._root_ids = data['root_ids'].astype(np.int64) if 'root_ids' in data else None
@@ -133,9 +120,9 @@ class SimEngine:
             for name in self.group_labels:
                 self._group_indices.append(data['group_' + name].astype(np.int32))
 
-            self._neuron_to_group = cp.full(self.n_neurons, -1, dtype=cp.int32)
+            self._neuron_to_group = np.full(self.n_neurons, -1, dtype=np.int32)
             for g, indices in enumerate(self._group_indices):
-                self._neuron_to_group[cp.asarray(indices.astype(np.int64))] = g
+                self._neuron_to_group[indices] = g
 
             # Body sensory groups
             self._body_sensory = {}
@@ -156,17 +143,17 @@ class SimEngine:
 
             self._motor_group_names = list(self._body_motor.keys())
             self._num_motor_groups = len(self._motor_group_names)
-            self._neuron_to_motor = cp.full(self.n_neurons, -1, dtype=cp.int32)
+            self._neuron_to_motor = np.full(self.n_neurons, -1, dtype=np.int32)
             for g, name in enumerate(self._motor_group_names):
                 indices = self._body_motor[name]
-                self._neuron_to_motor[cp.asarray(indices.astype(np.int64))] = g
+                self._neuron_to_motor[indices] = g
 
             self._use_annotations = True
             print(f"  {len(self._stimuli)} stimuli, {self.num_groups} heatmap groups")
             print(f"  {len(self._body_sensory)} body sensory, {len(self._body_motor)} body motor")
 
         else:
-            print(f"No annotation file found ({ANNOTATIONS_FILE})")
+            print(f"No matching annotation file available ({ANNOTATIONS_FILE})")
             print("  Run download_metadata.py for biological annotations.")
             self._root_ids = None
             self._positions = None
@@ -185,9 +172,9 @@ class SimEngine:
             end = start + group_size if g < self.num_groups - 1 else self.n_neurons
             self._group_indices.append(np.arange(start, end, dtype=np.int32))
 
-        self._neuron_to_group = cp.full(self.n_neurons, -1, dtype=cp.int32)
+        self._neuron_to_group = np.full(self.n_neurons, -1, dtype=np.int32)
         for g, indices in enumerate(self._group_indices):
-            self._neuron_to_group[cp.asarray(indices.astype(np.int64))] = g
+            self._neuron_to_group[indices] = g
 
         self._stimuli = {
             "Neurons 0-1000": np.arange(0, min(1000, self.n_neurons), dtype=np.int32),
@@ -196,146 +183,71 @@ class SimEngine:
         self._body_motor = {}
         self._motor_group_names = []
         self._num_motor_groups = 0
-        self._neuron_to_motor = cp.full(self.n_neurons, -1, dtype=cp.int32)
+        self._neuron_to_motor = np.full(self.n_neurons, -1, dtype=np.int32)
 
     def inject_stimulus(self, neuron_indices, amplitude=0.5):
-        self._stimulus_indices = cp.asarray(np.array(neuron_indices, dtype=np.int64))
-        self._stimulus_amplitude = float(amplitude)
+        with self._lock:
+            self._backend.set_stimulus(neuron_indices, amplitude)
+            self._stimulus_indices = np.unique(np.asarray(neuron_indices, dtype=np.uint32))
+            self._stimulus_amplitude = float(amplitude)
 
     def clear_stimulus(self):
-        self._stimulus_indices = None
-        self._stimulus_amplitude = 0.0
+        with self._lock:
+            self._backend.clear_stimulus()
+            self._stimulus_indices = None
+            self._stimulus_amplitude = 0.0
 
     def set_noise_amp(self, value):
-        self.noise_amp = np.float32(value)
+        value = np.float32(value)
+        if not np.isfinite(value):
+            raise ValueError("Noise amplitude must be finite")
+        with self._lock:
+            self.noise_amp = value
 
     def step(self, n=50):
-        """Run n timesteps and return a metrics dict.
+        """Run a native batch with GPU-side counts and no per-substep readback."""
+        with self._lock:
+            return self._step(n)
 
-        ZERO per-substep GPU→CPU syncs:
-        - propagate_v2 reads d_num_spikes from device memory (no CPU readback)
-        - count_spikes kernel counts groups/motors/total from spike_bits on GPU
-        - compact kernel still runs (needed for propagate's spike_idx array)
-        - Single sync at batch end to transfer results to CPU
-        - active_indices only transferred when send_active_indices is True
-        """
+    def _step(self, n):
+        interval = self.active_indices_interval
+        if not isinstance(interval, (int, np.integer)) or interval < 1:
+            raise ValueError("active_indices_interval must be a positive integer")
         t_start = time.perf_counter()
-
-        # GPU accumulators — zeroed once, accumulated across all substeps (uint64 for atomicAdd)
-        d_group_counts = cp.zeros(self.num_groups, dtype=cp.uint64)
-        d_motor_counts = cp.zeros(max(self._num_motor_groups, 1), dtype=cp.uint64)
-        d_total_spikes = self.d_total_spikes
-        d_total_spikes.fill(0)
-
-        # Local refs to avoid Python attribute lookups in inner loop
-        d_current = self.d_current
-        d_voltage = self.d_voltage
-        d_spike_bits = self.d_spike_bits
-        d_spike_idx = self.d_spike_idx
-        d_num_spikes = self.d_num_spikes
-        d_offsets = self.d_offsets
-        d_targets = self.d_targets
-        d_weights = self.d_weights
-        d_weight_scales = self.d_weight_scales
-        neuron_to_group = self._neuron_to_group
-        neuron_to_motor = self._neuron_to_motor
-        k_update_with_noise = self.kernels["update_with_noise"]
-        k_compact = self.kernels["compact"]
-        k_propagate_v2 = self.kernels["propagate_v2"]
-        k_count = self.kernels["count_spikes"]
-        neuron_blocks = self.neuron_blocks
-        compact_blocks = self.compact_blocks
-        BLOCK = self.BLOCK
-        PROP_BLOCK = self.PROP_BLOCK
-        MAX_PROP_BLOCKS = self.MAX_PROP_BLOCKS
-        n_neurons_i32 = np.int32(self.n_neurons)
-        spike_words_i32 = np.int32(self.spike_words)
-        stim_indices = self._stimulus_indices
-        stim_amp = self._stimulus_amplitude
-
-        for sub in range(n):
-            d_num_spikes.fill(0)
-
-            if stim_indices is not None:
-                d_current[stim_indices] += stim_amp
-
-            k_update_with_noise(
-                (neuron_blocks,), (BLOCK,),
-                (d_voltage, d_current, d_spike_bits,
-                 n_neurons_i32, spike_words_i32,
-                 self.tau_decay, self.v_threshold, self.v_reset,
-                 np.uint32(self.seed), np.uint32(self.current_step),
-                 self.noise_amp))
-
-            k_compact(
-                (compact_blocks,), (BLOCK,),
-                (d_spike_bits, d_spike_idx, d_num_spikes,
-                 spike_words_i32, n_neurons_i32))
-
-            # Count group/motor/total spikes from spike_bits — pure GPU, no sync
-            k_count(
-                (compact_blocks,), (BLOCK,),
-                (d_spike_bits, neuron_to_group, d_group_counts,
-                 neuron_to_motor, d_motor_counts, d_total_spikes,
-                 spike_words_i32, n_neurons_i32))
-
-            # Propagate v2 — reads d_num_spikes from device memory, no CPU sync
-            k_propagate_v2(
-                (MAX_PROP_BLOCKS,), (PROP_BLOCK,),
-                (d_spike_idx, d_num_spikes,
-                 d_offsets, d_targets, d_weights, d_weight_scales, d_current))
-
-            self.current_step += 1
-
-        # === Single batch-end sync — all GPU work done ===
-        cp.cuda.Stream.null.synchronize()
-
-        total_spikes = int(d_total_spikes[0])
+        self._backend.step(n, decay=self.tau_decay, threshold=self.v_threshold,
+                           reset=self.v_reset, noise=self.noise_amp)
+        native = self._backend.read_metrics()
+        self.current_step += n
+        total_spikes = native["total_spikes"]
         t_elapsed = time.perf_counter() - t_start
-        firing_rate = total_spikes / (n * self.n_neurons) if self.n_neurons > 0 else 0
-        steps_per_sec = n / t_elapsed if t_elapsed > 0 else 0
-
         result = {
             "step": self.current_step,
             "spike_count": total_spikes,
-            "firing_rate": round(firing_rate, 6),
-            "mean_voltage": round(float(d_voltage.mean()), 4),
-            "steps_per_sec": round(steps_per_sec, 1),
+            "firing_rate": round(total_spikes / (n * self.n_neurons), 6),
+            "mean_voltage": round(native["mean_voltage"], 4),
+            "steps_per_sec": round(n / t_elapsed, 1) if t_elapsed > 0 else 0,
         }
-
-        # Group rates (for heatmap) — only compute if enabled
         if self.send_group_rates:
-            group_spike_counts = d_group_counts.get()
             group_rates = []
-            for g in range(self.num_groups):
-                group_n = len(self._group_indices[g])
-                rate = float(group_spike_counts[g]) / (n * group_n) if group_n > 0 else 0
+            for g, indices in enumerate(self._group_indices):
+                group_n = len(indices)
+                rate = float(native["group_counts"][g]) / (n * group_n) if group_n else 0
                 group_rates.append(round(rate, 6))
             self.group_rates_history.append(group_rates)
             if len(self.group_rates_history) > 200:
-                self.group_rates_history = self.group_rates_history[-200:]
+                del self.group_rates_history[:-200]
             result["group_rates"] = group_rates
-
-        # Motor rates — only compute if enabled
         if self.send_motor_rates:
-            motor_spike_counts = d_motor_counts.get()
             motor_rates = {}
             for g, name in enumerate(self._motor_group_names):
                 group_n = len(self._body_motor[name])
-                rate = float(motor_spike_counts[g]) / (n * group_n) if group_n > 0 else 0
+                rate = float(native["motor_counts"][g]) / (n * group_n) if group_n else 0
                 motor_rates[name] = round(rate, 6)
             result["motor_rates"] = motor_rates
-
-        # Active indices (for 3D viz) — only transfer every Nth batch
         self._batch_counter += 1
-        if self.send_active_indices and self._batch_counter % self.active_indices_interval == 0:
-            num_last = int(d_num_spikes[0])
-            if num_last > 0:
-                self._last_spike_indices = d_spike_idx[:num_last].get().astype(np.int32)
-            else:
-                self._last_spike_indices = np.array([], dtype=np.int32)
+        if self.send_active_indices and self._batch_counter % interval == 0:
+            self._last_spike_indices = self._backend.read_spikes()
             result["active_indices"] = self._last_spike_indices.tolist()
-
         return result
 
     # --- Data accessors ---
@@ -396,26 +308,34 @@ class SimEngine:
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="FlyWire SYCL simulation engine")
     parser.add_argument("--data", help="Binary connectome file")
     parser.add_argument("--steps", type=int, default=500)
     parser.add_argument("--batch", type=int, default=50)
+    parser.add_argument("--device", help="Explicit SYCL selector (or FASTFLY_DEVICE)")
+    parser.add_argument("--neurons", type=int, default=139255)
+    parser.add_argument("--synapses", type=int, default=54500000)
     args = parser.parse_args()
-
-    engine = SimEngine(data_file=args.data)
-    print(f"\nSimEngine ready: {engine.n_neurons} neurons, {engine.n_synapses} synapses")
-    print(f"Stimuli: {engine.get_predefined_stimuli()}")
-    print(f"Groups:  {engine.group_labels}")
-    print(f"Positions: {'yes' if engine._positions is not None else 'no'}")
-    print(f"Running {args.steps} steps in batches of {args.batch}...\n")
-
-    for i in range(0, args.steps, args.batch):
-        metrics = engine.step(n=args.batch)
-        print(f"  Step {metrics['step']:>6d}  "
-              f"spikes={metrics['spike_count']:>6d}  "
-              f"rate={metrics['firing_rate']*100:>5.2f}%  "
-              f"V_mean={metrics['mean_voltage']:.3f}  "
-              f"active_3d={len(metrics.get('active_indices', []))}  "
-              f"steps/s={metrics['steps_per_sec']:.0f}")
-
-    print("\nDone.")
+    if args.steps < 1 or args.batch < 1:
+        parser.error("--steps and --batch must be positive")
+    try:
+        with SimEngine(data_file=args.data, n_neurons=args.neurons, n_synapses=args.synapses,
+                       device_selector=args.device) as engine:
+            print(f"\nSimEngine ready: {engine.n_neurons} neurons, {engine.n_synapses} synapses")
+            print(f"SYCL device: {engine.device_name}")
+            print(f"Stimuli: {engine.get_predefined_stimuli()}")
+            print(f"Groups:  {engine.group_labels}")
+            print(f"Positions: {'yes' if engine._positions is not None else 'no'}")
+            print(f"Running {args.steps} steps in batches of {args.batch}...\n")
+            for i in range(0, args.steps, args.batch):
+                metrics = engine.step(n=min(args.batch, args.steps - i))
+                print(f"  Step {metrics['step']:>6d}  "
+                      f"spikes={metrics['spike_count']:>6d}  "
+                      f"rate={metrics['firing_rate']*100:>5.2f}%  "
+                      f"V_mean={metrics['mean_voltage']:.3f}  "
+                      f"active_3d={len(metrics.get('active_indices', []))}  "
+                      f"steps/s={metrics['steps_per_sec']:.0f}")
+        print("\nDone.")
+    except (RuntimeError, OSError, ValueError) as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        sys.exit(1)

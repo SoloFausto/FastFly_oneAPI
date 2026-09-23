@@ -1,59 +1,32 @@
 @echo off
-REM ================================================================
-REM FlyWire Connectome GPU Simulator - Build Script
-REM ================================================================
-
-where nvcc >nul 2>&1
-if %errorlevel% neq 0 (
-    echo.
-    echo ERROR: nvcc not found on PATH.
-    echo Please install NVIDIA CUDA Toolkit from:
-    echo   https://developer.nvidia.com/cuda-downloads
+setlocal
+REM Run from an Intel oneAPI command prompt with Visual Studio C++ tools.
+set "BUILD_TYPE=Release"
+if /I "%~1"=="clean" goto clean
+if /I "%~1"=="debug" set "BUILD_TYPE=Debug"
+where icx >nul 2>&1
+if errorlevel 1 (
+    echo ERROR: icx not found. Initialize the Intel oneAPI DPC++/C++ environment.
     exit /b 1
 )
-
-echo.
-echo CUDA Compiler:
-nvcc --version | findstr "release"
-echo.
-
-if "%1"=="clean" goto do_clean
-if "%1"=="debug" goto do_debug
-goto do_release
-
-:do_clean
-echo Cleaning build artifacts...
-del /q flywire_sim.exe 2>nul
-del /q flywire_sim.lib 2>nul
-del /q flywire_sim.exp 2>nul
-del /q flywire_sim.pdb 2>nul
-del /q *.obj 2>nul
-echo Done.
+where cmake >nul 2>&1
+if errorlevel 1 (
+    echo ERROR: CMake 3.20 or later is required.
+    exit /b 1
+)
+where ninja >nul 2>&1
+if errorlevel 1 (
+    echo ERROR: Ninja is required. Install it and add it to PATH.
+    exit /b 1
+)
+cmake -S "%~dp0." -B "%~dp0build" -G Ninja -DCMAKE_CXX_COMPILER=icx -DCMAKE_BUILD_TYPE=%BUILD_TYPE%
+if errorlevel 1 exit /b 1
+cmake --build "%~dp0build" --parallel
+if errorlevel 1 exit /b 1
+echo Build successful. Run build\flywire_sim.exe or python flywire_sim.py
 exit /b 0
 
-:do_debug
-echo Building DEBUG...
-nvcc -g -G -lineinfo -arch=sm_86 -o flywire_sim.exe flywire_sim.cu
-goto check_result
-
-:do_release
-echo Building RELEASE (optimized for RTX 3080 Ti, SM 8.6)...
-nvcc -O3 -arch=sm_86 --use_fast_math -o flywire_sim.exe flywire_sim.cu
-goto check_result
-
-:check_result
-if %errorlevel% neq 0 (
-    echo.
-    echo BUILD FAILED.
-    echo If you see "unsupported gpu architecture sm_86", try sm_80.
-    exit /b 1
-)
-
-echo.
-echo Build successful: flywire_sim.exe
-echo.
-echo Run with:
-echo   flywire_sim.exe
-echo   flywire_sim.exe --data flywire_v783.bin
-echo   flywire_sim.exe --help
-echo.
+:clean
+if not exist "%~dp0build\CMakeCache.txt" exit /b 0
+cmake --build "%~dp0build" --target clean
+exit /b %errorlevel%

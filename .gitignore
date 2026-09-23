@@ -12,6 +12,9 @@ Completeness_783.csv
 *.exp
 *.lib
 *.pdb
+*.dll
+*.so
+build/
 
 # Python
 __pycache__/
@@ -19,3 +22,7 @@ __pycache__/
 
 # Misc
 nul
+app_server.py
+
+# profiling
+profiling/
