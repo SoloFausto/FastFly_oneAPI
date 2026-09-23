@@ -2,7 +2,6 @@
 
 GPU-accelerated simulator for the complete *Drosophila melanogaster* (fruit fly) brain connectome — 139,255 neurons and 54.5 million synapses — targeting real-time or faster performance on Intel Arc GPUs using Intel oneAPI SYCL. Performance depends on the graph and hardware; NVIDIA benchmark results from the previous implementation do not apply to Arc.
 
-![Fruit fly brain](fruitfly.jpg)
 
 ## How it works
 
